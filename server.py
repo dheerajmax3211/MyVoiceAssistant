@@ -45,7 +45,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Dheeraj's Voice Assistant (TTS)</title>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Dancing+Script:wght@700&family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@500&family=Pacifico&family=Yellowtail&display=swap" rel="stylesheet">
 <style>
 *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 ::selection { background: rgba(0, 240, 255, 0.25); color: #fff; }
@@ -112,11 +112,12 @@ body {
 
 .header { text-align: center; margin-bottom: 24px; }
 .header h1 {
-  font-size: 30px; font-weight: 700; letter-spacing: -0.5px; margin-bottom: 4px;
-  background: linear-gradient(135deg, var(--cyan), var(--magenta), var(--lime));
-  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-  background-clip: text;
-  text-shadow: 0 0 30px rgba(0,240,255,0.3);
+  font-family: 'Dancing Script', 'Yellowtail', 'Pacifico', cursive;
+  font-size: 48px; font-weight: 700; line-height: 1.2; margin-bottom: 16px;
+  color: #ff1493;
+  filter: drop-shadow(0 0 14px rgba(255,20,147,0.25)) drop-shadow(0 2px 4px rgba(0,0,0,0.6));
+  text-shadow: 0 0 10px rgba(255,20,147,0.3);
+  letter-spacing: 1px;
 }
 .header .divider {
   height: 1px; margin: 10px auto 0; width: 0;
@@ -283,7 +284,7 @@ textarea::placeholder { color: rgba(255,255,255,0.14); }
 <div class="wrapper">
   <div class="card">
     <div class="header">
-      <h1>You type, I speak</h1>
+      <h1>You Type, I Speak</h1>
       <div class="divider"></div>
       <p>paste text &bull; pick a voice &bull; hit play</p>
     </div>
