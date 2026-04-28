@@ -274,6 +274,25 @@ textarea::placeholder { color: rgba(255,255,255,0.14); }
   50%  { box-shadow: 0 0 24px rgba(0,240,255,0.5); }
   100% { box-shadow: 0 0 8px rgba(0,240,255,0.2); }
 }
+
+.visualizer-wrap {
+  position: relative; height: 0; overflow: hidden;
+  margin: 0; transition: height 0.35s ease, margin 0.35s ease;
+  border-radius: 12px;
+  background: rgba(0,0,0,0.3);
+  border: 1px solid transparent;
+}
+.visualizer-wrap.active {
+  height: 72px; margin: 12px 0;
+  border-color: rgba(255,20,147,0.15);
+  box-shadow: 0 0 24px rgba(255,20,147,0.06), inset 0 0 24px rgba(255,20,147,0.03);
+}
+.visualizer-wrap canvas {
+  display: block; width: 100%; height: 100%;
+  opacity: 0; transition: opacity 0.25s;
+}
+.visualizer-wrap.active canvas { opacity: 1; }
+
 </style>
 </head>
 <body>
@@ -325,6 +344,10 @@ textarea::placeholder { color: rgba(255,255,255,0.14); }
       <div class="char-count" id="charCount">0 chars</div>
     </div>
 
+    <div class="visualizer-wrap" id="visualizerWrap">
+      <canvas id="waveCanvas"></canvas>
+    </div>
+
     <div class="status-bar">
       <div class="typing-indicator" id="typingIndicator">
         <div class="typing-dots"><i></i><i></i><i></i></div>
@@ -359,9 +382,15 @@ var charCount   = document.getElementById('charCount');
 var wrap        = document.getElementById('textareaWrap');
 var canvas      = document.getElementById('neonCanvas');
 var ctx         = canvas.getContext('2d');
+var waveCanvas  = document.getElementById('waveCanvas');
+var waveCtx     = waveCanvas.getContext('2d');
+var vizWrap     = document.getElementById('visualizerWrap');
 
 var audio = null;
 var audioBlob = null;
+var audioCtx = null;
+var analyser = null;
+var vizAnimId = null;
 
 /* --- NEON CANVAS BACKGROUND --- */
 function resizeCanvas() {
@@ -449,6 +478,86 @@ function drawNeon() {
 }
 drawNeon();
 
+/* --- WAVEFORM VISUALIZER --- */
+function resizeWaveCanvas() {
+  var rect = vizWrap.getBoundingClientRect();
+  var dpr = window.devicePixelRatio || 1;
+  waveCanvas.width  = rect.width * dpr;
+  waveCanvas.height = rect.height * dpr;
+  waveCtx.scale(dpr, dpr);
+  waveCanvas.style.width  = rect.width + 'px';
+  waveCanvas.style.height = rect.height + 'px';
+}
+
+function initVisualizer() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  if (audioCtx.state === 'suspended') {
+    audioCtx.resume();
+  }
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 256;
+  analyser.smoothingTimeConstant = 0.85;
+  var source = audioCtx.createMediaElementSource(audio);
+  source.connect(analyser);
+  analyser.connect(audioCtx.destination);
+
+  vizWrap.classList.add('active');
+  resizeWaveCanvas();
+  var bufferLength = analyser.frequencyBinCount;
+  var dataArray = new Uint8Array(bufferLength);
+
+  function drawWaveform() {
+    vizAnimId = requestAnimationFrame(drawWaveform);
+    analyser.getByteTimeDomainData(dataArray);
+
+    var w = waveCanvas.width / (window.devicePixelRatio || 1);
+    var h = waveCanvas.height / (window.devicePixelRatio || 1);
+    waveCtx.clearRect(0, 0, w, h);
+
+    waveCtx.lineWidth = 2;
+    waveCtx.beginPath();
+    var sliceWidth = w / bufferLength;
+    var x = 0;
+    for (var i = 0; i < bufferLength; i++) {
+      var v = dataArray[i] / 128.0;
+      var y = (v * h) / 2;
+      if (i === 0) waveCtx.moveTo(x, y);
+      else waveCtx.lineTo(x, y);
+      x += sliceWidth;
+    }
+    waveCtx.lineTo(w, h / 2);
+
+    var gradient = waveCtx.createLinearGradient(0, 0, w, 0);
+    gradient.addColorStop(0, '#ff1493');
+    gradient.addColorStop(0.5, '#ff00ff');
+    gradient.addColorStop(1, '#00f0ff');
+    waveCtx.strokeStyle = gradient;
+    waveCtx.shadowColor = '#ff1493';
+    waveCtx.shadowBlur = 8;
+    waveCtx.stroke();
+
+    waveCtx.strokeStyle = '#ff1493';
+    waveCtx.shadowBlur = 18;
+    waveCtx.lineWidth = 0.8;
+    waveCtx.stroke();
+
+    waveCtx.shadowBlur = 0;
+  }
+  drawWaveform();
+}
+
+function stopVisualizer() {
+  if (vizAnimId) { cancelAnimationFrame(vizAnimId); vizAnimId = null; }
+  vizWrap.classList.remove('active');
+  if (analyser) { analyser.disconnect(); analyser = null; }
+}
+
+window.addEventListener('resize', function() {
+  if (vizWrap.classList.contains('active')) resizeWaveCanvas();
+});
+
 /* --- SETTINGS --- */
 var rateLabels = {
   '-50': 'Very Slow', '-25': 'Slow', '0': 'Normal',
@@ -508,11 +617,13 @@ async function speak() {
     downloadBtn.style.display = 'inline-block';
 
     audio.play();
+    initVisualizer();
     audio.onended = function() {
       playBtn.innerHTML = '&#9654; Play';
       playBtn.classList.remove('speaking');
       playBtn.classList.add('pulse-ring');
       statusEl.textContent = 'Finished';
+      stopVisualizer();
       URL.revokeObjectURL(url);
       audio = null;
     };
@@ -521,6 +632,7 @@ async function speak() {
       playBtn.classList.remove('speaking');
       playBtn.classList.add('pulse-ring');
       statusEl.textContent = 'Playback error';
+      stopVisualizer();
       audio = null;
     };
   } catch (err) {
@@ -536,6 +648,7 @@ async function speak() {
 
 function stopAudio() {
   if (audio) { audio.pause(); audio.currentTime = 0; audio = null; }
+  stopVisualizer();
   playBtn.innerHTML = '&#9654; Play';
   playBtn.classList.remove('speaking');
   playBtn.classList.add('pulse-ring');
@@ -557,11 +670,12 @@ function downloadMp3() {
 playBtn.addEventListener('click', speak);
 downloadBtn.addEventListener('click', downloadMp3);
 stopBtn.addEventListener('click', function() {
-  stopAudio(); statusEl.textContent = '';
+  stopAudio(); stopVisualizer(); statusEl.textContent = '';
   downloadBtn.style.display = 'none'; audioBlob = null;
 });
 clearBtn.addEventListener('click', function() {
   textInput.value = ''; statusEl.textContent = ''; charCount.textContent = '0 chars';
+  stopVisualizer();
   wrap.classList.remove('char-glow');
   downloadBtn.style.display = 'none'; audioBlob = null; textInput.focus();
 });
