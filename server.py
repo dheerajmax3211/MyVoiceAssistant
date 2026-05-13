@@ -72,6 +72,7 @@ PITCH = "+0Hz"
 _active_doc = []       # list of elements
 _last_audio = None
 _last_text = ""
+_seen_headers = set()  # Track recent headers to avoid repetition
 
 ALLOWED_IMAGE_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
 MAX_IMAGES_PER_REQUEST = 10
@@ -222,7 +223,7 @@ def parse_hocr(hocr_html):
     
     # Heuristic thresholds
     indent_threshold = median_left + (median_height * 0.8)
-    short_line_threshold = median_right - (median_height * 1.5)
+    short_line_threshold = median_right - (median_height * 2.5)
     gap_threshold = median_height * 0.5
     
     groups = []
@@ -241,7 +242,9 @@ def parse_hocr(hocr_html):
             is_new_par = True
         # 2. Previous line ended early (short line)
         elif prev["bbox"][2] < short_line_threshold:
-            is_new_par = True
+            # Exception: if it ends with a comma, hyphen, or conjunction, it's likely a wrapped line, not a paragraph break
+            if not prev["text"].strip().endswith((',', '-', '—')):
+                is_new_par = True
         # 3. Indented first line relative to document AND previous line
         elif curr["bbox"][0] > indent_threshold and curr["bbox"][0] > prev["bbox"][0] + (median_height * 0.5):
             is_new_par = True
@@ -444,6 +447,60 @@ def download():
     return send_file(_last_audio, mimetype="audio/mpeg", as_attachment=True, download_name=download_name)
 
 
+# ── Continuity utilities ───────────────────────────────────
+import re
+
+def process_page_elements(elements):
+    """Strip footers and repetitive headers from a single page's elements."""
+    if not elements:
+        return []
+        
+    # Footer: Check if last few elements are page numbers or very short noise
+    # We check up to the last 2 elements just in case Tesseract picked up a smudge below the footer
+    for _ in range(2):
+        if not elements:
+            break
+        last_text = elements[-1]["text"].strip()
+        if re.match(r'^(\d+|page\s*\d+|[ivxlcdm]+)$', last_text, re.IGNORECASE) or len(last_text) <= 3:
+            elements.pop()
+        else:
+            break
+            
+    # Header: Check if first element is short and repetitive
+    if elements:
+        first_text = elements[0]["text"].strip()
+        if len(first_text) < 60:
+            if first_text.lower() in _seen_headers:
+                elements.pop(0)
+            else:
+                _seen_headers.add(first_text.lower())
+                
+    return elements
+
+def merge_element_lists(list1, list2):
+    """Merge two lists of elements, combining boundary paragraphs if they flow together."""
+    if not list1: return list2
+    if not list2: return list1
+    
+    res = list(list1)
+    incoming = list(list2)
+    
+    if res[-1]["type"] == "paragraph" and incoming[0]["type"] == "paragraph":
+        last_par = res[-1]["text"].strip()
+        first_par = incoming[0]["text"].strip()
+        
+        ends_with_terminator = last_par.endswith(('.', '!', '?', '"', "'", '”', '’'))
+        starts_with_lowercase = first_par[0].islower() if first_par else False
+        
+        if not ends_with_terminator or starts_with_lowercase:
+            # Merge!
+            res[-1]["text"] = last_par + " " + first_par
+            incoming.pop(0)
+            
+    res.extend(incoming)
+    return res
+
+
 # ── OCR endpoint ─────────────────────────────────────────
 @app.route("/ocr", methods=["POST"])
 def ocr_endpoint():
@@ -463,8 +520,11 @@ def ocr_endpoint():
         try:
             pil_img = Image.open(f.stream)
             elements = ocr_image(pil_img)
-            all_elements.extend(elements)
-            logger.info(f"OCR extracted {len(elements)} elements from {f.filename}")
+            elements = process_page_elements(elements)
+            
+            # Merge elements within this batch seamlessly
+            all_elements = merge_element_lists(all_elements, elements)
+            logger.info(f"OCR processed {f.filename}")
         except Exception as e:
             logger.error(f"OCR failed for {f.filename}: {e}")
             return jsonify({"error": f"OCR failed for {f.filename}: {str(e)}"}), 500
@@ -479,8 +539,9 @@ def doc_append():
     data = request.get_json()
     if not data or "elements" not in data:
         return jsonify({"error": "No elements provided"}), 400
-    _active_doc.extend(data["elements"])
-    logger.info(f"Appended {len(data['elements'])} elements. Doc now has {len(_active_doc)} elements.")
+        
+    _active_doc = merge_element_lists(_active_doc, data["elements"])
+    logger.info(f"Appended elements. Doc now has {len(_active_doc)} elements.")
     return jsonify({"ok": True, "total": len(_active_doc)})
 
 
@@ -503,8 +564,9 @@ def doc_save():
 
 @app.route("/doc/new", methods=["POST"])
 def doc_new():
-    global _active_doc
+    global _active_doc, _seen_headers
     _active_doc = []
+    _seen_headers.clear()
     logger.info("Document cleared")
     return jsonify({"ok": True})
 
