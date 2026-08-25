@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import asyncio
 import logging
 import urllib.request
@@ -91,6 +92,72 @@ EMOTIONS = {
     "Casual Host (Podcast style)":         "newscast-casual",
     "Neutral / Natural":                   "default",
 }
+
+def normalize_text_for_speech(text: str) -> str:
+    """
+    Intelligently cleans and normalizes text for natural speech synthesis.
+    Eliminates spoken 'slash', 'dash', 'hyphen', and raw punctuation artifacts.
+    """
+    if not text:
+        return ""
+
+    # 1. Clean markdown code blocks and inline code
+    text = re.sub(r"```[\s\S]*?```", "", text)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"^[=\-_*#]{3,}\s*$", "", text, flags=re.MULTILINE)
+
+    # 2. Markdown headers, blockquotes, bold, italics, links
+    text = re.sub(r"^#+\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^>\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"\*([^*]+)\*", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+
+    # 3. Bullet points and list markers (prevent saying 'dash' or 'bullet')
+    text = re.sub(r"^\s*[-*•–—]\s+", "", text, flags=re.MULTILINE)
+
+    # 4. Spaced hyphens, em-dashes, en-dashes -> natural comma pause
+    text = re.sub(r"\s*[—–]\s*", ", ", text)
+    text = re.sub(r"\s+-\s+", ", ", text)
+
+    # 5. Number ranges & phone numbers (e.g. 10-20 -> 10 to 20)
+    text = re.sub(r"(\d+)\s*-\s*(\d+)", r"\1 to \2", text)
+
+    # 6. Slashes & common abbreviations
+    text = re.sub(r"\b24/7\b", "twenty four seven", text, flags=re.IGNORECASE)
+    text = re.sub(r"\band/or\b", "and or", text, flags=re.IGNORECASE)
+    text = re.sub(r"\beither/or\b", "either or", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bw/o\b", "without", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bw/\b", "with", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bn/a\b", "not applicable", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bkm/h\b", "kilometers per hour", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bmph\b", "miles per hour", text, flags=re.IGNORECASE)
+
+    # Common fractions
+    text = re.sub(r"\b1/2\b", "one half", text)
+    text = re.sub(r"\b1/4\b", "one quarter", text)
+    text = re.sub(r"\b3/4\b", "three quarters", text)
+
+    # Dates with slashes (e.g. 12/25/2026 -> 12 25 2026)
+    text = re.sub(r"(\d+)/(\d+)/(\d+)", r"\1 \2 \3", text)
+
+    # Word slashes (e.g. input/output -> input or output)
+    text = re.sub(r"([a-zA-Z0-9]+)/([a-zA-Z0-9]+)", r"\1 or \2", text)
+    text = re.sub(r"\s*/\s*", " or ", text)
+
+    # 7. Symbols & shorthands
+    text = re.sub(r"&", " and ", text)
+    text = re.sub(r"~(?=\d)", "approximately ", text)
+    text = re.sub(r"%", " percent", text)
+    text = re.sub(r"\+", " plus ", text)
+
+    # 8. Clean excessive punctuation and whitespace
+    text = re.sub(r"\.{3,}", ".", text)
+    text = re.sub(r",\s*,+", ",", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n\n", text).strip()
+
+    return text
 
 _last_audio = None
 _last_text = ""
@@ -242,6 +309,19 @@ input[type="range"]::-moz-range-thumb {
   cursor: pointer; border: 2px solid #000;
 }
 
+.clean-toggle {
+  display: flex; align-items: center; justify-content: space-between;
+  background: rgba(0,240,255,0.03); border: 1px solid rgba(0,240,255,0.12);
+  border-radius: 10px; padding: 8px 14px; margin-bottom: 12px;
+}
+.clean-toggle label {
+  font-size: 12px; color: rgba(255,255,255,0.7); cursor: pointer;
+  display: flex; align-items: center; gap: 8px;
+}
+.clean-toggle input[type="checkbox"] {
+  accent-color: var(--cyan); cursor: pointer; width: 15px; height: 15px;
+}
+
 .textarea-wrap {
   position: relative; background: rgba(0,0,0,0.4);
   border: 1px solid rgba(255,255,255,0.06); border-radius: 14px;
@@ -373,7 +453,7 @@ textarea::placeholder { color: rgba(255,255,255,0.18); }
       <h1>You Type, I Speak</h1>
       <span class="badge" id="engineBadge">⚡ Kokoro Neural (ChatGPT / Claude Empathy)</span>
       <div class="divider"></div>
-      <p>rich emotional intonation &bull; empathetic prosody &bull; free & local</p>
+      <p>rich emotional intonation &bull; natural prosody &bull; free & local</p>
     </div>
 
     <div class="settings-grid">
@@ -399,6 +479,14 @@ textarea::placeholder { color: rgba(255,255,255,0.18); }
         <label class="select-label">Speed &mdash; <span class="rate-display" id="rateDisplay">Normal (1.0x)</span></label>
         <input type="range" id="rateSlider" min="50" max="150" value="100" step="5">
       </div>
+    </div>
+
+    <!-- Smart Speech Preprocessor Toggle -->
+    <div class="clean-toggle">
+      <label for="normalizeCheck">
+        <input type="checkbox" id="normalizeCheck" checked>
+        <span>✨ <strong>Smart Normalizer:</strong> Speak slashes as "or", clean bullet dashes & em-dashes into natural pauses</span>
+      </label>
     </div>
 
     <div class="textarea-wrap" id="textareaWrap">
@@ -444,6 +532,7 @@ var emotionGroup   = document.getElementById('emotionGroup');
 var engineBadge    = document.getElementById('engineBadge');
 var rateSlider     = document.getElementById('rateSlider');
 var rateDisplay    = document.getElementById('rateDisplay');
+var normalizeCheck = document.getElementById('normalizeCheck');
 var charCount      = document.getElementById('charCount');
 var wrap           = document.getElementById('textareaWrap');
 var canvas         = document.getElementById('neonCanvas');
@@ -701,6 +790,7 @@ async function speak() {
   var voiceName = voiceSelect.value;
   var speedVal = parseInt(rateSlider.value) / 100.0;
   var emotion = emotionSelect.value;
+  var normalize = normalizeCheck.checked;
 
   try {
     var resp = await fetch('/speak', {
@@ -711,7 +801,8 @@ async function speak() {
         engine: engine,
         voice: voiceName,
         speed: speedVal,
-        emotion: emotion
+        emotion: emotion,
+        normalize: normalize
       })
     });
     if (!resp.ok) {
@@ -880,16 +971,23 @@ def speak():
     if not data or "text" not in data:
         return {"error": "No text provided"}, 400
 
-    text = data["text"].strip()
-    if not text:
+    raw_text = data["text"].strip()
+    if not raw_text:
         return {"error": "Empty text"}, 400
 
     engine = data.get("engine", "kokoro")
     voice_name = data.get("voice", "")
     speed = float(data.get("speed", 1.0))
     emotion = data.get("emotion", "default")
+    should_normalize = data.get("normalize", True)
 
-    logger.info(f"Generating TTS: engine={engine} voice={voice_name} speed={speed} emotion={emotion} length={len(text)} chars")
+    # Normalize text to remove awkward spoken slashes, dashes, bullets
+    if should_normalize:
+        text = normalize_text_for_speech(raw_text)
+    else:
+        text = raw_text
+
+    logger.info(f"Generating TTS: engine={engine} voice={voice_name} speed={speed} normalized={should_normalize} len={len(text)}")
 
     try:
         if engine == "kokoro" and kokoro_engine is not None:
@@ -902,7 +1000,7 @@ def speak():
         logger.info(f"TTS generated: {audio_io.getbuffer().nbytes} bytes ({mime})")
 
         _last_audio = io.BytesIO(audio_io.getvalue())
-        _last_text = text
+        _last_text = raw_text
         _last_mime = mime
 
         return send_file(audio_io, mimetype=mime)
@@ -915,7 +1013,7 @@ def speak():
                 logger.info("Retrying with Edge-TTS fallback...")
                 audio_io, mime = _generate_edge_tts(text, speed=speed, emotion="default")
                 _last_audio = io.BytesIO(audio_io.getvalue())
-                _last_text = text
+                _last_text = raw_text
                 _last_mime = mime
                 return send_file(audio_io, mimetype=mime)
             except Exception as fallback_e:
