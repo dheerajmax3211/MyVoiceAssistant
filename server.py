@@ -1,28 +1,76 @@
 import os
 import io
+import re
 import asyncio
 import logging
+import urllib.request
+import soundfile as sf
 from flask import Flask, request, send_file, render_template_string
-
 import edge_tts
+from kokoro_onnx import Kokoro
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("TTS-Server")
 
 app = Flask(__name__)
 
-VOICES = {
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(BASE_DIR, "models")
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+KOKORO_MODEL_PATH = os.path.join(MODELS_DIR, "kokoro-v1.0.onnx")
+KOKORO_VOICES_PATH = os.path.join(MODELS_DIR, "voices-v1.0.bin")
+
+KOKORO_MODEL_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx"
+KOKORO_VOICES_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
+
+def ensure_kokoro_models():
+    if not os.path.exists(KOKORO_MODEL_PATH):
+        logger.info(f"Downloading Kokoro ONNX model from {KOKORO_MODEL_URL}...")
+        urllib.request.urlretrieve(KOKORO_MODEL_URL, KOKORO_MODEL_PATH)
+        logger.info("Kokoro ONNX model downloaded.")
+    if not os.path.exists(KOKORO_VOICES_PATH):
+        logger.info(f"Downloading Kokoro voice embeddings from {KOKORO_VOICES_URL}...")
+        urllib.request.urlretrieve(KOKORO_VOICES_URL, KOKORO_VOICES_PATH)
+        logger.info("Kokoro voice embeddings downloaded.")
+
+# Initialize Kokoro
+kokoro_engine = None
+try:
+    ensure_kokoro_models()
+    kokoro_engine = Kokoro(KOKORO_MODEL_PATH, KOKORO_VOICES_PATH)
+    logger.info("Kokoro Neural Engine initialized successfully.")
+except Exception as e:
+    logger.warning(f"Failed to initialize Kokoro engine: {e}. Falling back to Edge-TTS.")
+
+# Voice dictionaries
+KOKORO_VOICES = {
+    "❤️ Heart (US Female - Warm & Empathetic)":    "af_heart",
+    "✨ Bella (US Female - Expressive & Lively)":    "af_bella",
+    "🌿 Sarah (US Female - Calm & Soothing)":        "af_sarah",
+    "🎙️ Nicole (US Female - Conversational)":       "af_nicole",
+    "☀️ Sky (US Female - Cheerful & Bright)":        "af_sky",
+    "🎭 Jessica (US Female - Dramatic & Emotive)":   "af_jessica",
+    "☕ Adam (US Male - Warm & Deep)":               "am_adam",
+    "🗣️ Michael (US Male - Conversational)":        "am_michael",
+    "⚡ Eric (US Male - Crisp & Upbeat)":            "am_eric",
+    "📖 Fenrir (US Male - Rich Storyteller)":        "am_fenrir",
+    "🇬🇧 Emma (UK Female - Empathetic & Clear)":     "bf_emma",
+    "🇬🇧 Isabella (UK Female - Eloquent)":           "bf_isabella",
+    "🇬🇧 George (UK Male - Warm Narrator)":          "bm_george",
+    "🇬🇧 Lewis (UK Male - Casual & Relaxed)":        "bm_lewis",
+}
+
+EDGE_VOICES = {
     "Jenny (US - Female)":       "en-US-JennyNeural",
     "Guy (US - Male)":           "en-US-GuyNeural",
     "Aria (US - Female)":        "en-US-AriaNeural",
     "Davis (US - Male)":         "en-US-DavisNeural",
+    "Sara (US - Female)":        "en-US-SaraNeural",
     "Jane (US - Female)":        "en-US-JaneNeural",
     "Jason (US - Male)":         "en-US-JasonNeural",
-    "Sara (US - Female)":        "en-US-SaraNeural",
     "Tony (US - Male)":          "en-US-TonyNeural",
     "Amber (US - Female)":       "en-US-AmberNeural",
-    "Brandon (US - Male)":       "en-US-BrandonNeural",
-    "Cora (US - Female)":        "en-US-CoraNeural",
     "Christopher (US - Male)":   "en-US-ChristopherNeural",
     "Sonia (UK - Female)":       "en-GB-SoniaNeural",
     "Ryan (UK - Male)":          "en-GB-RyanNeural",
@@ -32,19 +80,95 @@ VOICES = {
     "Prabhat (India - Male)":    "en-IN-PrabhatNeural",
 }
 
-VOICE = "en-US-JennyNeural"
-RATE = "+0%"
-PITCH = "+0Hz"
+EMOTIONS = {
+    "Empathetic (Caring & Understanding)": "empathetic",
+    "Excited (High Energy & Joy)":         "excited",
+    "Cheerful (Warm & Smiling)":           "cheerful",
+    "Chat / Conversational (Casual)":      "chat",
+    "Friendly (Approachable)":             "friendly",
+    "Hopeful (Optimistic)":                "hopeful",
+    "Whispering (Soft & Intimate)":        "whispering",
+    "Storyteller (Relaxed Narration)":     "narration-relaxed",
+    "Casual Host (Podcast style)":         "newscast-casual",
+    "Neutral / Natural":                   "default",
+}
+
+def normalize_text_for_speech(text: str) -> str:
+    """
+    Intelligently cleans and normalizes text for natural speech synthesis.
+    Eliminates spoken 'slash', 'dash', 'hyphen', and raw punctuation artifacts.
+    """
+    if not text:
+        return ""
+
+    # 1. Clean markdown code blocks and inline code
+    text = re.sub(r"```[\s\S]*?```", "", text)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"^[=\-_*#]{3,}\s*$", "", text, flags=re.MULTILINE)
+
+    # 2. Markdown headers, blockquotes, bold, italics, links
+    text = re.sub(r"^#+\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^>\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"\*([^*]+)\*", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+
+    # 3. Bullet points and list markers (prevent saying 'dash' or 'bullet')
+    text = re.sub(r"^\s*[-*•–—]\s+", "", text, flags=re.MULTILINE)
+
+    # 4. Spaced hyphens, em-dashes, en-dashes -> natural comma pause
+    text = re.sub(r"\s*[—–]\s*", ", ", text)
+    text = re.sub(r"\s+-\s+", ", ", text)
+
+    # 5. Number ranges & phone numbers (e.g. 10-20 -> 10 to 20)
+    text = re.sub(r"(\d+)\s*-\s*(\d+)", r"\1 to \2", text)
+
+    # 6. Slashes & common abbreviations
+    text = re.sub(r"\b24/7\b", "twenty four seven", text, flags=re.IGNORECASE)
+    text = re.sub(r"\band/or\b", "and or", text, flags=re.IGNORECASE)
+    text = re.sub(r"\beither/or\b", "either or", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bw/o\b", "without", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bw/\b", "with", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bn/a\b", "not applicable", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bkm/h\b", "kilometers per hour", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bmph\b", "miles per hour", text, flags=re.IGNORECASE)
+
+    # Common fractions
+    text = re.sub(r"\b1/2\b", "one half", text)
+    text = re.sub(r"\b1/4\b", "one quarter", text)
+    text = re.sub(r"\b3/4\b", "three quarters", text)
+
+    # Dates with slashes (e.g. 12/25/2026 -> 12 25 2026)
+    text = re.sub(r"(\d+)/(\d+)/(\d+)", r"\1 \2 \3", text)
+
+    # Word slashes (e.g. input/output -> input or output)
+    text = re.sub(r"([a-zA-Z0-9]+)/([a-zA-Z0-9]+)", r"\1 or \2", text)
+    text = re.sub(r"\s*/\s*", " or ", text)
+
+    # 7. Symbols & shorthands
+    text = re.sub(r"&", " and ", text)
+    text = re.sub(r"~(?=\d)", "approximately ", text)
+    text = re.sub(r"%", " percent", text)
+    text = re.sub(r"\+", " plus ", text)
+
+    # 8. Clean excessive punctuation and whitespace
+    text = re.sub(r"\.{3,}", ".", text)
+    text = re.sub(r",\s*,+", ",", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n\n", text).strip()
+
+    return text
 
 _last_audio = None
 _last_text = ""
+_last_mime = "audio/wav"
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Dheeraj's Voice Assistant (TTS)</title>
+<title>Dheeraj's Voice Assistant (Emotional AI TTS)</title>
 <link href="https://fonts.googleapis.com/css2?family=Dancing+Script:wght@700&family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@500&family=Pacifico&family=Yellowtail&display=swap" rel="stylesheet">
 <style>
 *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
@@ -83,11 +207,11 @@ body {
   );
 }
 
-.wrapper { position: relative; z-index: 10; width: 100%; max-width: 680px; }
+.wrapper { position: relative; z-index: 10; width: 100%; max-width: 720px; }
 
 .card {
   position: relative; background: rgba(10,10,15,0.85);
-  backdrop-filter: blur(24px); border-radius: 20px; padding: 40px 36px;
+  backdrop-filter: blur(24px); border-radius: 20px; padding: 36px 32px;
   border: 1px solid rgba(255,255,255,0.06);
   box-shadow:
     0 0 40px rgba(0,240,255,0.06),
@@ -110,32 +234,41 @@ body {
   to   { opacity: 1; transform: translateY(0) scale(1); }
 }
 
-.header { text-align: center; margin-bottom: 24px; }
+.header { text-align: center; margin-bottom: 22px; }
 .header h1 {
   font-family: 'Dancing Script', 'Yellowtail', 'Pacifico', cursive;
-  font-size: 48px; font-weight: 700; line-height: 1.2; margin-bottom: 16px;
+  font-size: 46px; font-weight: 700; line-height: 1.2; margin-bottom: 10px;
   color: #ff1493;
   filter: drop-shadow(0 0 14px rgba(255,20,147,0.25)) drop-shadow(0 2px 4px rgba(0,0,0,0.6));
   text-shadow: 0 0 10px rgba(255,20,147,0.3);
   letter-spacing: 1px;
 }
+.header .badge {
+  display: inline-block; padding: 3px 10px; border-radius: 12px;
+  font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px;
+  background: rgba(0,240,255,0.12); color: var(--cyan); border: 1px solid rgba(0,240,255,0.3);
+  margin-top: 4px;
+}
 .header .divider {
-  height: 1px; margin: 10px auto 0; width: 0;
+  height: 1px; margin: 12px auto 0; width: 0;
   background: linear-gradient(90deg, transparent, var(--cyan), var(--magenta), transparent);
   animation: dividerGrow 0.7s 0.3s ease-out forwards;
 }
-@keyframes dividerGrow { to { width: 65%; } }
-.header p { color: rgba(255,255,255,0.3); font-size: 13px; margin-top: 8px; letter-spacing: 0.5px; }
+@keyframes dividerGrow { to { width: 70%; } }
+.header p { color: rgba(255,255,255,0.35); font-size: 13px; margin-top: 8px; letter-spacing: 0.5px; }
 
-.settings-row {
-  display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap;
+.settings-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 16px;
 }
-.settings-row > * { flex: 1; min-width: 160px; }
+@media (max-width: 600px) {
+  .settings-grid { grid-template-columns: 1fr; }
+}
 
 .select-group { position: relative; }
 .select-label {
-  display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 1.5px;
-  color: rgba(255,255,255,0.3); margin-bottom: 6px; font-weight: 600;
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 11px; text-transform: uppercase; letter-spacing: 1.5px;
+  color: rgba(255,255,255,0.35); margin-bottom: 6px; font-weight: 600;
 }
 .neon-select {
   width: 100%; appearance: none; -webkit-appearance: none;
@@ -162,6 +295,7 @@ body {
 input[type="range"] {
   -webkit-appearance: none; appearance: none; width: 100%; height: 6px;
   background: rgba(255,255,255,0.06); border-radius: 3px; outline: none; cursor: pointer;
+  margin-top: 8px;
 }
 input[type="range"]::-webkit-slider-thumb {
   -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%;
@@ -173,6 +307,19 @@ input[type="range"]::-moz-range-thumb {
   width: 18px; height: 18px; border-radius: 50%;
   background: var(--cyan); box-shadow: 0 0 12px rgba(0,240,255,0.5);
   cursor: pointer; border: 2px solid #000;
+}
+
+.clean-toggle {
+  display: flex; align-items: center; justify-content: space-between;
+  background: rgba(0,240,255,0.03); border: 1px solid rgba(0,240,255,0.12);
+  border-radius: 10px; padding: 8px 14px; margin-bottom: 12px;
+}
+.clean-toggle label {
+  font-size: 12px; color: rgba(255,255,255,0.7); cursor: pointer;
+  display: flex; align-items: center; gap: 8px;
+}
+.clean-toggle input[type="checkbox"] {
+  accent-color: var(--cyan); cursor: pointer; width: 15px; height: 15px;
 }
 
 .textarea-wrap {
@@ -190,12 +337,12 @@ input[type="range"]::-moz-range-thumb {
 }
 
 textarea {
-  display: block; width: 100%; min-height: 150px; background: transparent;
-  border: none; outline: none; resize: vertical; padding: 18px 20px;
+  display: block; width: 100%; min-height: 140px; background: transparent;
+  border: none; outline: none; resize: vertical; padding: 16px 18px;
   color: rgba(255,255,255,0.85); font-size: 15px; line-height: 1.7;
   font-family: inherit;
 }
-textarea::placeholder { color: rgba(255,255,255,0.14); }
+textarea::placeholder { color: rgba(255,255,255,0.18); }
 
 .char-count {
   position: absolute; bottom: 8px; right: 16px;
@@ -228,9 +375,9 @@ textarea::placeholder { color: rgba(255,255,255,0.14); }
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-.status-text { font-size: 12px; color: rgba(255,255,255,0.3); }
+.status-text { font-size: 12px; color: rgba(255,255,255,0.35); font-family: 'JetBrains Mono', monospace; }
 
-.controls { display: flex; gap: 10px; margin-top: 14px; }
+.controls { display: flex; gap: 10px; margin-top: 12px; }
 .btn {
   padding: 12px 16px; border: none; border-radius: 10px;
   font-size: 14px; font-weight: 600; cursor: pointer;
@@ -304,43 +451,46 @@ textarea::placeholder { color: rgba(255,255,255,0.14); }
   <div class="card">
     <div class="header">
       <h1>You Type, I Speak</h1>
+      <span class="badge" id="engineBadge">⚡ Kokoro Neural (ChatGPT / Claude Empathy)</span>
       <div class="divider"></div>
-      <p>paste text &bull; pick a voice &bull; hit play</p>
+      <p>rich emotional intonation &bull; natural prosody &bull; free & local</p>
     </div>
 
-    <div class="settings-row">
+    <div class="settings-grid">
       <div class="select-group">
-        <label class="select-label">Voice</label>
-        <select class="neon-select" id="voiceSelect">
-          <option value="Jenny (US - Female)">Jenny (US - Female)</option>
-          <option value="Guy (US - Male)">Guy (US - Male)</option>
-          <option value="Aria (US - Female)">Aria (US - Female)</option>
-          <option value="Davis (US - Male)">Davis (US - Male)</option>
-          <option value="Jane (US - Female)">Jane (US - Female)</option>
-          <option value="Jason (US - Male)">Jason (US - Male)</option>
-          <option value="Sara (US - Female)">Sara (US - Female)</option>
-          <option value="Tony (US - Male)">Tony (US - Male)</option>
-          <option value="Amber (US - Female)">Amber (US - Female)</option>
-          <option value="Brandon (US - Male)">Brandon (US - Male)</option>
-          <option value="Cora (US - Female)">Cora (US - Female)</option>
-          <option value="Christopher (US - Male)">Christopher (US - Male)</option>
-          <option value="Sonia (UK - Female)">Sonia (UK - Female)</option>
-          <option value="Ryan (UK - Male)">Ryan (UK - Male)</option>
-          <option value="Libby (UK - Female)">Libby (UK - Female)</option>
-          <option value="Thomas (UK - Male)">Thomas (UK - Male)</option>
-          <option value="Neerja (India - Female)">Neerja (India - Female)</option>
-          <option value="Prabhat (India - Male)">Prabhat (India - Male)</option>
+        <label class="select-label">Engine</label>
+        <select class="neon-select" id="engineSelect">
+          <option value="kokoro" selected>⚡ Kokoro Neural (Local AI — High Empathy)</option>
+          <option value="edge">🌐 Microsoft Neural (SSML Expressive)</option>
         </select>
       </div>
 
-      <div>
-        <label class="select-label">Speed &mdash; <span class="rate-display" id="rateDisplay">Normal</span></label>
-        <input type="range" id="rateSlider" min="-50" max="50" value="0" step="5">
+      <div class="select-group">
+        <label class="select-label">Voice</label>
+        <select class="neon-select" id="voiceSelect"></select>
+      </div>
+
+      <div class="select-group" id="emotionGroup" style="display: none;">
+        <label class="select-label">Emotion / Style</label>
+        <select class="neon-select" id="emotionSelect"></select>
+      </div>
+
+      <div class="select-group" id="speedGroup">
+        <label class="select-label">Speed &mdash; <span class="rate-display" id="rateDisplay">Normal (1.0x)</span></label>
+        <input type="range" id="rateSlider" min="50" max="150" value="100" step="5">
       </div>
     </div>
 
+    <!-- Smart Speech Preprocessor Toggle -->
+    <div class="clean-toggle">
+      <label for="normalizeCheck">
+        <input type="checkbox" id="normalizeCheck" checked>
+        <span>✨ <strong>Smart Normalizer:</strong> Speak slashes as "or", clean bullet dashes & em-dashes into natural pauses</span>
+      </label>
+    </div>
+
     <div class="textarea-wrap" id="textareaWrap">
-      <textarea id="textInput" placeholder="Paste or type text here..."></textarea>
+      <textarea id="textInput" placeholder="Paste or type text here (articles, stories, thoughts, notes)..."></textarea>
       <div class="char-count" id="charCount">0 chars</div>
     </div>
 
@@ -351,7 +501,7 @@ textarea::placeholder { color: rgba(255,255,255,0.14); }
     <div class="status-bar">
       <div class="typing-indicator" id="typingIndicator">
         <div class="typing-dots"><i></i><i></i><i></i></div>
-        <span>Generating speech...</span>
+        <span id="generatingText">Synthesizing emotional speech...</span>
       </div>
       <div class="spinner" id="spinner"></div>
       <div class="status-text" id="status"></div>
@@ -361,36 +511,82 @@ textarea::placeholder { color: rgba(255,255,255,0.14); }
       <button class="btn btn-play pulse-ring" id="playBtn">&#9654; Play</button>
       <button class="btn btn-stop" id="stopBtn">&#9632; Stop</button>
       <button class="btn btn-clear" id="clearBtn">Clear</button>
-      <button class="btn btn-download" id="downloadBtn">&#10515; MP3</button>
+      <button class="btn btn-download" id="downloadBtn">&#10515; Audio</button>
     </div>
   </div>
 </div>
 
 <script>
-var textInput   = document.getElementById('textInput');
-var playBtn     = document.getElementById('playBtn');
-var stopBtn     = document.getElementById('stopBtn');
-var clearBtn    = document.getElementById('clearBtn');
-var downloadBtn = document.getElementById('downloadBtn');
-var statusEl    = document.getElementById('status');
-var spinner     = document.getElementById('spinner');
-var typing      = document.getElementById('typingIndicator');
-var voiceSelect = document.getElementById('voiceSelect');
-var rateSlider  = document.getElementById('rateSlider');
-var rateDisplay = document.getElementById('rateDisplay');
-var charCount   = document.getElementById('charCount');
-var wrap        = document.getElementById('textareaWrap');
-var canvas      = document.getElementById('neonCanvas');
-var ctx         = canvas.getContext('2d');
-var waveCanvas  = document.getElementById('waveCanvas');
-var waveCtx     = waveCanvas.getContext('2d');
-var vizWrap     = document.getElementById('visualizerWrap');
+var textInput      = document.getElementById('textInput');
+var playBtn        = document.getElementById('playBtn');
+var stopBtn        = document.getElementById('stopBtn');
+var clearBtn       = document.getElementById('clearBtn');
+var downloadBtn    = document.getElementById('downloadBtn');
+var statusEl       = document.getElementById('status');
+var spinner        = document.getElementById('spinner');
+var typing         = document.getElementById('typingIndicator');
+var engineSelect   = document.getElementById('engineSelect');
+var voiceSelect    = document.getElementById('voiceSelect');
+var emotionSelect  = document.getElementById('emotionSelect');
+var emotionGroup   = document.getElementById('emotionGroup');
+var engineBadge    = document.getElementById('engineBadge');
+var rateSlider     = document.getElementById('rateSlider');
+var rateDisplay    = document.getElementById('rateDisplay');
+var normalizeCheck = document.getElementById('normalizeCheck');
+var charCount      = document.getElementById('charCount');
+var wrap           = document.getElementById('textareaWrap');
+var canvas         = document.getElementById('neonCanvas');
+var ctx            = canvas.getContext('2d');
+var waveCanvas     = document.getElementById('waveCanvas');
+var waveCtx        = waveCanvas.getContext('2d');
+var vizWrap        = document.getElementById('visualizerWrap');
 
 var audio = null;
 var audioBlob = null;
 var audioCtx = null;
 var analyser = null;
 var vizAnimId = null;
+
+var KOKORO_VOICE_LIST = {{ kokoro_voices | tojson }};
+var EDGE_VOICE_LIST   = {{ edge_voices | tojson }};
+var EMOTION_LIST      = {{ emotions | tojson }};
+
+function populateVoices() {
+  var engine = engineSelect.value;
+  voiceSelect.innerHTML = '';
+  var list = (engine === 'kokoro') ? KOKORO_VOICE_LIST : EDGE_VOICE_LIST;
+  for (var name in list) {
+    var opt = document.createElement('option');
+    opt.value = name;
+    opt.textContent = name;
+    voiceSelect.appendChild(opt);
+  }
+  if (engine === 'kokoro') {
+    emotionGroup.style.display = 'none';
+    engineBadge.textContent = '⚡ Kokoro Neural (ChatGPT / Claude Empathy)';
+    engineBadge.style.color = 'var(--cyan)';
+    engineBadge.style.borderColor = 'rgba(0,240,255,0.3)';
+  } else {
+    emotionGroup.style.display = 'block';
+    engineBadge.textContent = '🌐 Microsoft Neural (SSML Emotion Styler)';
+    engineBadge.style.color = 'var(--magenta)';
+    engineBadge.style.borderColor = 'rgba(255,0,255,0.3)';
+  }
+}
+
+function populateEmotions() {
+  emotionSelect.innerHTML = '';
+  for (var name in EMOTION_LIST) {
+    var opt = document.createElement('option');
+    opt.value = EMOTION_LIST[name];
+    opt.textContent = name;
+    emotionSelect.appendChild(opt);
+  }
+}
+
+engineSelect.addEventListener('change', populateVoices);
+populateEmotions();
+populateVoices();
 
 /* --- NEON CANVAS BACKGROUND --- */
 function resizeCanvas() {
@@ -432,7 +628,6 @@ function drawNeon() {
   var w = canvas.width, h = canvas.height;
   ctx.clearRect(0, 0, w, h);
 
-  /* neon lines */
   for (var i = 0; i < lines.length; i++) {
     var l = lines[i];
     l.x += l.vx; l.y += l.vy; l.angle += l.spin;
@@ -448,7 +643,6 @@ function drawNeon() {
     ctx.lineWidth = 0.6;
     ctx.stroke();
 
-    /* glow */
     ctx.beginPath();
     ctx.moveTo(l.x, l.y);
     ctx.lineTo(l.x + dx, l.y + dy);
@@ -457,7 +651,6 @@ function drawNeon() {
     ctx.stroke();
   }
 
-  /* particles */
   for (var j = 0; j < particles.length; j++) {
     var pt = particles[j];
     pt.x += pt.vx; pt.y += pt.vy;
@@ -542,7 +735,6 @@ function initVisualizer() {
     waveCtx.shadowBlur = 18;
     waveCtx.lineWidth = 0.8;
     waveCtx.stroke();
-
     waveCtx.shadowBlur = 0;
   }
   drawWaveform();
@@ -558,17 +750,18 @@ window.addEventListener('resize', function() {
   if (vizWrap.classList.contains('active')) resizeWaveCanvas();
 });
 
-/* --- SETTINGS --- */
-var rateLabels = {
-  '-50': 'Very Slow', '-25': 'Slow', '0': 'Normal',
-  '25': 'Fast', '50': 'Very Fast'
-};
+/* --- SPEED SLIDER --- */
 function updateRateDisplay() {
-  var v = parseInt(rateSlider.value);
-  rateDisplay.textContent = rateLabels[String(v)] || (v > 0 ? '+' + v + '%' : v + '%');
-  if (v === 0) rateDisplay.style.color = 'var(--cyan)';
-  else if (v > 0) rateDisplay.style.color = 'var(--lime)';
-  else rateDisplay.style.color = 'var(--orange)';
+  var speedVal = parseInt(rateSlider.value) / 100.0;
+  rateDisplay.textContent = speedVal.toFixed(2) + 'x';
+  if (speedVal === 1.0) {
+    rateDisplay.textContent = 'Normal (1.0x)';
+    rateDisplay.style.color = 'var(--cyan)';
+  } else if (speedVal > 1.0) {
+    rateDisplay.style.color = 'var(--lime)';
+  } else {
+    rateDisplay.style.color = 'var(--orange)';
+  }
 }
 rateSlider.addEventListener('input', updateRateDisplay);
 updateRateDisplay();
@@ -588,22 +781,34 @@ async function speak() {
   stopAudio();
   playBtn.disabled = true;
   playBtn.classList.remove('pulse-ring');
-  playBtn.innerHTML = '&#9678; Generating...';
+  playBtn.innerHTML = '&#9678; Synthesizing...';
   spinner.style.display = 'block';
   typing.style.display = 'flex';
   statusEl.textContent = '';
 
+  var engine = engineSelect.value;
   var voiceName = voiceSelect.value;
-  var rateNum = parseInt(rateSlider.value);
-  var rateVal = (rateNum >= 0 ? '+' : '') + rateNum + '%';
+  var speedVal = parseInt(rateSlider.value) / 100.0;
+  var emotion = emotionSelect.value;
+  var normalize = normalizeCheck.checked;
 
   try {
     var resp = await fetch('/speak', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: text, voice: voiceName, rate: rateVal })
+      body: JSON.stringify({
+        text: text,
+        engine: engine,
+        voice: voiceName,
+        speed: speedVal,
+        emotion: emotion,
+        normalize: normalize
+      })
     });
-    if (!resp.ok) throw new Error('Server error');
+    if (!resp.ok) {
+      var errData = await resp.json().catch(function() { return {}; });
+      throw new Error(errData.error || 'Server error');
+    }
 
     audioBlob = await resp.blob();
     var url = URL.createObjectURL(audioBlob);
@@ -641,7 +846,7 @@ async function speak() {
     playBtn.classList.add('pulse-ring');
     spinner.style.display = 'none';
     typing.style.display = 'none';
-    statusEl.textContent = 'Failed to generate speech';
+    statusEl.textContent = 'TTS Error: ' + err.message;
     console.error(err);
   }
 }
@@ -654,11 +859,12 @@ function stopAudio() {
   playBtn.classList.add('pulse-ring');
 }
 
-function downloadMp3() {
+function downloadAudio() {
   if (!audioBlob) return;
   var url = URL.createObjectURL(audioBlob);
   var a = document.createElement('a');
-  var filename = (textInput.value.trim().slice(0, 40).replace(/\s+/g, '_') || 'speech') + '.mp3';
+  var ext = audioBlob.type.includes('wav') ? '.wav' : '.mp3';
+  var filename = (textInput.value.trim().slice(0, 40).replace(/\s+/g, '_') || 'speech') + ext;
   a.href = url;
   a.download = filename;
   document.body.appendChild(a);
@@ -668,7 +874,7 @@ function downloadMp3() {
 }
 
 playBtn.addEventListener('click', speak);
-downloadBtn.addEventListener('click', downloadMp3);
+downloadBtn.addEventListener('click', downloadAudio);
 stopBtn.addEventListener('click', function() {
   stopAudio(); stopVisualizer(); statusEl.textContent = '';
   downloadBtn.style.display = 'none'; audioBlob = null;
@@ -681,7 +887,7 @@ clearBtn.addEventListener('click', function() {
 });
 
 document.addEventListener('keydown', function(e) {
-  if (e.ctrlKey && e.key === 'Enter') { e.preventDefault(); speak(); }
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); speak(); }
 });
 </script>
 </body>
@@ -690,69 +896,152 @@ document.addEventListener('keydown', function(e) {
 
 @app.route("/")
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    return render_template_string(
+        HTML_TEMPLATE,
+        kokoro_voices=KOKORO_VOICES,
+        edge_voices=EDGE_VOICES,
+        emotions=EMOTIONS,
+    )
 
 
-def _generate_tts(text, voice=None, rate=None):
+def _generate_kokoro_tts(text, voice_key="af_heart", speed=1.0):
+    global kokoro_engine
+    if kokoro_engine is None:
+        raise RuntimeError("Kokoro Neural engine is not available.")
+
+    # Determine language from voice code
+    lang = "en-gb" if voice_key.startswith("b") else "en-us"
+    samples, sample_rate = kokoro_engine.create(text, voice=voice_key, speed=speed, lang=lang)
+
+    wav_io = io.BytesIO()
+    sf.write(wav_io, samples, sample_rate, format="WAV")
+    wav_io.seek(0)
+    return wav_io, "audio/wav"
+
+
+def _generate_edge_tts(text, voice="en-US-JennyNeural", speed=1.0, emotion="default"):
+    # Calculate percentage speed offset
+    rate_pct = int(round((speed - 1.0) * 100))
+    rate_str = f"{'+' if rate_pct >= 0 else ''}{rate_pct}%"
+
+    # Escape XML entities for SSML
+    safe_text = (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
+
+    if emotion and emotion != "default":
+        ssml = f"""<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="en-US">
+  <voice name="{voice}">
+    <mstts:express-as style="{emotion}" styledegree="1.5">
+      <prosody rate="{rate_str}">
+        {safe_text}
+      </prosody>
+    </mstts:express-as>
+  </voice>
+</speak>"""
+    else:
+        ssml = f"""<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">
+  <voice name="{voice}">
+    <prosody rate="{rate_str}">
+      {safe_text}
+    </prosody>
+  </voice>
+</speak>"""
+
     async def _run():
-        v = voice or VOICE
-        r = rate or RATE
-        communicate = edge_tts.Communicate(text, v, rate=r, pitch=PITCH)
+        communicate = edge_tts.Communicate(ssml, voice)
         mp3_data = io.BytesIO()
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
                 mp3_data.write(chunk["data"])
         mp3_data.seek(0)
         return mp3_data
-    return asyncio.run(_run())
+
+    return asyncio.run(_run()), "audio/mpeg"
 
 
 @app.route("/speak", methods=["POST"])
 def speak():
+    global _last_audio, _last_text, _last_mime
     data = request.get_json()
     if not data or "text" not in data:
         return {"error": "No text provided"}, 400
 
-    text = data["text"].strip()
-    if not text:
+    raw_text = data["text"].strip()
+    if not raw_text:
         return {"error": "Empty text"}, 400
 
-    voice = data.get("voice")
-    rate = data.get("rate")
+    engine = data.get("engine", "kokoro")
+    voice_name = data.get("voice", "")
+    speed = float(data.get("speed", 1.0))
+    emotion = data.get("emotion", "default")
+    should_normalize = data.get("normalize", True)
 
-    voice_short = VOICES.get(voice, voice or VOICE)
+    # Normalize text to remove awkward spoken slashes, dashes, bullets
+    if should_normalize:
+        text = normalize_text_for_speech(raw_text)
+    else:
+        text = raw_text
 
-    logger.info(f"Generating speech: '{text[:80]}...' ({len(text)} chars) voice={voice_short} rate={rate}")
+    logger.info(f"Generating TTS: engine={engine} voice={voice_name} speed={speed} normalized={should_normalize} len={len(text)}")
 
     try:
-        mp3_data = _generate_tts(text, voice=voice_short, rate=rate)
-        logger.info(f"Generated {mp3_data.getbuffer().nbytes} bytes of audio")
+        if engine == "kokoro" and kokoro_engine is not None:
+            voice_code = KOKORO_VOICES.get(voice_name, voice_name or "af_heart")
+            audio_io, mime = _generate_kokoro_tts(text, voice_key=voice_code, speed=speed)
+        else:
+            voice_code = EDGE_VOICES.get(voice_name, voice_name or "en-US-JennyNeural")
+            audio_io, mime = _generate_edge_tts(text, voice=voice_code, speed=speed, emotion=emotion)
 
-        _last_audio = io.BytesIO(mp3_data.getvalue())
-        _last_text = text
+        logger.info(f"TTS generated: {audio_io.getbuffer().nbytes} bytes ({mime})")
 
-        return send_file(mp3_data, mimetype="audio/mpeg")
+        _last_audio = io.BytesIO(audio_io.getvalue())
+        _last_text = raw_text
+        _last_mime = mime
+
+        return send_file(audio_io, mimetype=mime)
 
     except Exception as e:
-        logger.error(f"TTS generation failed: {e}")
+        logger.error(f"TTS generation failed: {e}", exc_info=True)
+        # Fallback to Edge if Kokoro failed
+        if engine == "kokoro":
+            try:
+                logger.info("Retrying with Edge-TTS fallback...")
+                audio_io, mime = _generate_edge_tts(text, speed=speed, emotion="default")
+                _last_audio = io.BytesIO(audio_io.getvalue())
+                _last_text = raw_text
+                _last_mime = mime
+                return send_file(audio_io, mimetype=mime)
+            except Exception as fallback_e:
+                return {"error": str(fallback_e)}, 500
         return {"error": str(e)}, 500
 
 
 @app.route("/voices")
 def list_voices():
-    return {"voices": list(VOICES.keys())}
+    return {
+        "kokoro_voices": list(KOKORO_VOICES.keys()),
+        "edge_voices": list(EDGE_VOICES.keys()),
+        "emotions": list(EMOTIONS.keys()),
+    }
 
 
 @app.route("/download")
 def download():
+    global _last_audio, _last_text, _last_mime
     if _last_audio is None:
         return {"error": "No audio generated yet"}, 404
 
     _last_audio.seek(0)
-    download_name = (_last_text[:40].strip().replace(" ", "_") or "speech") + ".mp3"
+    ext = ".wav" if "wav" in _last_mime else ".mp3"
+    download_name = (_last_text[:40].strip().replace(" ", "_") or "speech") + ext
     return send_file(
         _last_audio,
-        mimetype="audio/mpeg",
+        mimetype=_last_mime,
         as_attachment=True,
         download_name=download_name,
     )
@@ -760,5 +1049,5 @@ def download():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5070))
-    logger.info(f"Starting TTS server on http://localhost:{port}")
+    logger.info(f"Starting Emotional Voice Assistant on http://localhost:{port}")
     app.run(host="0.0.0.0", port=port, debug=False)
